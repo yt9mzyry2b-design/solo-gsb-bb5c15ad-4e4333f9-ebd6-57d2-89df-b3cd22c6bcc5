@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import date
-from decimal import ROUND_HALF_EVEN, Decimal
+from decimal import ROUND_HALF_EVEN, Decimal, localcontext
 from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException
@@ -28,7 +28,7 @@ from .sampling import (
     WeightSamplingError,
     audit as weight_sampling_audit,
 )
-from .summary import WeightSummaryError, summarize
+from .summary import ARITHMETIC_PRECISION, WeightSummaryError, summarize
 from .traceaudit import EventConflictError, TraceAuditError, audit
 
 app = FastAPI(
@@ -1005,10 +1005,20 @@ def _dump(value: Any) -> str:
 
 
 def _six(value: Decimal) -> _RawNumber:
-    """Fixed-point token: ``value`` quantized half-even to six places."""
-    return _RawNumber(
-        format(value.quantize(SIX_PLACES, rounding=ROUND_HALF_EVEN), "f")
-    )
+    """Fixed-point token: ``value`` quantized half-even to six places.
+
+    The quantize needs one context digit per integer digit of ``value``
+    (plus one more for a possible rounding carry, e.g. 9.9999999 ->
+    10.000000) beyond the six fractional places, so the precision follows
+    the value's magnitude: huge values such as 1e30 render exactly
+    instead of raising :class:`decimal.InvalidOperation` against the
+    default 28-digit context.
+    """
+    with localcontext() as ctx:
+        ctx.prec = max(ARITHMETIC_PRECISION, value.adjusted() + 8)
+        return _RawNumber(
+            format(value.quantize(SIX_PLACES, rounding=ROUND_HALF_EVEN), "f")
+        )
 
 
 def _build_summary_response(result: dict) -> Response:

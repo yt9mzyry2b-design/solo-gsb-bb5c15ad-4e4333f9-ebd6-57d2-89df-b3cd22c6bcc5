@@ -1,5 +1,6 @@
 """End-to-end tests for the /weight-pick-plan endpoint."""
 
+import json
 from datetime import date
 from decimal import Decimal
 
@@ -332,6 +333,142 @@ def test_half_even_rounding_only_at_response():
     # 0.0000015 kg -> half-even rounds up to 0.000002
     resp = plan([scan(weight="3107000015")], [demand(quantity="0.0000015")])
     assert '"fulfilled":0.000002' in resp.text
+
+
+# ------------------------------------------------------------- huge quantity
+
+
+def test_huge_quantity_renders_exact_six_place_numbers():
+    resp = plan([scan()], [demand(quantity="1e30")])
+    assert resp.status_code == 200
+    # every weight field is a fixed-point six-place JSON number, never an
+    # exponent form, and the shortage keeps every digit of 1e30 - 2
+    assert '"quantity":1000000000000000000000000000000.000000' in resp.text
+    assert '"fulfilled":2.000000' in resp.text
+    assert '"shortage":999999999999999999999999999998.000000' in resp.text
+    assert '"overage":0.000000' in resp.text
+    assert '"excluded_weight":0.000000' in resp.text
+    assert '"weight":2.000000' in resp.text
+
+
+def test_huge_quantity_round_trips_without_precision_loss():
+    resp = plan([scan()], [demand(quantity="1e30")])
+    assert resp.status_code == 200
+    body = json.loads(resp.text, parse_float=Decimal)
+    d = body["demands"][0]
+    assert d["quantity"] == Decimal("1E+30")
+    assert d["fulfilled"] == 2
+    assert d["shortage"] == Decimal("999999999999999999999999999998")
+    assert d["overage"] == 0
+    assert d["excluded_weight"] == 0
+    assert d["allocations"] == [
+        {"batch": None, "expiry": "250131", "weight": Decimal("2.000000")}
+    ]
+
+
+def test_huge_json_number_quantity_is_exact():
+    # 1e30 as a JSON number must arrive as the exact Decimal, not float noise
+    resp = plan([scan()], [{"gtin": GTIN_OK, "quantity": 1e30}])
+    assert resp.status_code == 200
+    assert '"quantity":1000000000000000000000000000000.000000' in resp.text
+    assert '"shortage":999999999999999999999999999998.000000' in resp.text
+
+
+def test_quantity_beyond_default_arithmetic_precision_stays_exact():
+    # 1e60 overflows the fixed 50-digit arithmetic precision: the working
+    # precision must follow the quantity's magnitude, not truncate it.
+    resp = plan([scan()], [demand(quantity="1e60")])
+    assert resp.status_code == 200
+    assert '"fulfilled":2.000000' in resp.text
+    assert '"shortage":' + "9" * 59 + "8.000000" in resp.text
+
+
+def test_huge_quantity_with_excluded_stock():
+    resp = plan(
+        [scan(batch="OLD", expiry="250110"), scan(batch="OK", expiry="250331")],
+        [demand(quantity="1e30")],
+        as_of="2025-02-01",
+    )
+    assert resp.status_code == 200
+    d = resp.json()["demands"][0]
+    assert d["allocations"] == [{"batch": "OK", "expiry": "250331", "weight": 2.0}]
+    assert d["fulfilled"] == 2.0
+    assert '"shortage":999999999999999999999999999998.000000' in resp.text
+    assert '"excluded_weight":2.000000' in resp.text
+
+
+def test_huge_quantity_whole_mode_takes_everything():
+    resp = plan(
+        [scan(), scan(batch="B", expiry="250228")],
+        [whole_demand(quantity="1e30")],
+    )
+    assert resp.status_code == 200
+    d = resp.json()["demands"][0]
+    assert d["fulfilled"] == 4.0
+    assert d["overage"] == 0.0
+    assert '"shortage":999999999999999999999999999996.000000' in resp.text
+
+
+def test_huge_and_normal_quantities_in_one_request():
+    resp = plan(
+        [scan(), scan(gtin=GTIN2, weight="3103002513")],
+        [demand(quantity="1e30"), demand(gtin=GTIN2, quantity="2.513")],
+    )
+    assert resp.status_code == 200
+    first, second = resp.json()["demands"]
+    assert first["fulfilled"] == 2.0
+    assert '"shortage":999999999999999999999999999998.000000' in resp.text
+    # the ordinary demand is unaffected and still renders six places
+    assert second["fulfilled"] == 2.513
+    assert second["shortage"] == 0.0
+    assert '"quantity":2.513000' in resp.text
+
+
+def test_huge_quantity_carry_at_precision_boundary():
+    # 44 nines plus .9999999 rounds up to 1e44 at six places: the quantize
+    # context must leave room for the carry digit.
+    resp = plan(
+        [], [demand(quantity="99999999999999999999999999999999999999999999.9999999")]
+    )
+    assert resp.status_code == 200
+    assert '"quantity":1' + "0" * 44 + ".000000" in resp.text
+    assert '"shortage":1' + "0" * 44 + ".000000" in resp.text
+
+
+def test_ordinary_quantity_still_renders_six_places():
+    resp = plan([scan(), scan(batch="B", expiry="250228")], [demand(quantity="3")])
+    assert resp.status_code == 200
+    d = resp.json()["demands"][0]
+    assert [(a["batch"], a["weight"]) for a in d["allocations"]] == [
+        (None, 2.0),
+        ("B", 1.0),
+    ]
+    assert d["fulfilled"] == 3.0
+    assert d["shortage"] == 0.0
+    assert '"quantity":3.000000' in resp.text
+    assert '"fulfilled":3.000000' in resp.text
+    assert '"shortage":0.000000' in resp.text
+
+
+def test_huge_quantity_is_exact_decimal_in_direct_result():
+    from app.pickplan import pick_plan
+
+    result = pick_plan(
+        [scan()],
+        "kg",
+        [(GTIN_OK, Decimal("1E+30"), 0)],
+        date(2024, 1, 1),
+    )
+    d = result["demands"][0]
+    assert d["quantity"] == Decimal("1E+30")
+    assert d["fulfilled"] == Decimal(2)
+    assert d["shortage"] == Decimal("999999999999999999999999999998")
+    assert d["overage"] == Decimal(0)
+    assert d["excluded_weight"] == Decimal(0)
+    assert d["allocations"] == [
+        {"batch": None, "expiry": "250131", "weight": Decimal(2)}
+    ]
+    assert not isinstance(d["shortage"], float)
 
 
 # ---------------------------------------------------------------- scan errors

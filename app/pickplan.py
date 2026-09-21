@@ -389,6 +389,22 @@ def _whole_plan(
     }
 
 
+def _arithmetic_precision(demands: list[tuple[str, Decimal, int, str]]) -> int:
+    """Context precision for the plan arithmetic.
+
+    Subtracting scan weights from the demanded quantity must stay exact
+    however large the quantity is: on top of the usual headroom, allow
+    one digit per integer digit of the largest quantity so that e.g.
+    1e60 - 2 kg keeps its exact shortage instead of rounding away.
+    """
+    precision = ARITHMETIC_PRECISION
+    for _gtin, quantity, _min_remaining_days, _package_mode in demands:
+        precision = max(
+            precision, quantity.adjusted() + 1 + ARITHMETIC_PRECISION
+        )
+    return precision
+
+
 def pick_plan(
     scans: list[str],
     target_unit: str,
@@ -431,7 +447,7 @@ def pick_plan(
     packages_by_gtin: dict[str, list[dict]] = {}
 
     with localcontext() as ctx:
-        ctx.prec = ARITHMETIC_PRECISION
+        ctx.prec = _arithmetic_precision(normalized)
         for index, scan in enumerate(scans):
             try:
                 elements = parse(scan)
