@@ -334,6 +334,114 @@ def test_half_even_rounding_only_at_response():
     assert '"fulfilled":0.000002' in resp.text
 
 
+# ------------------------------------------------- very large quantities
+
+
+ONE_E30_FIXED = "1000000000000000000000000000000.000000"
+
+
+def test_huge_quantity_string_returns_200_and_keeps_full_precision():
+    # 1e30 needs 31 integer digits plus six fractional ones; rendering it
+    # under the default 28-digit context used to raise InvalidOperation
+    # (a 500). Every weight field must still render as a six-place number
+    # and the shortage arithmetic must stay exact at that scale.
+    resp = plan(
+        [scan(batch="EARLY"), scan(batch="LATE", expiry="250228")],
+        [demand(quantity="1e30")],
+    )
+    assert resp.status_code == 200
+    assert f'"quantity":{ONE_E30_FIXED}' in resp.text
+    assert '"fulfilled":4.000000' in resp.text
+    assert '"shortage":999999999999999999999999999996.000000' in resp.text
+    assert '"overage":0.000000' in resp.text
+    assert '"excluded_weight":0.000000' in resp.text
+    d = resp.json()["demands"][0]
+    assert [(a["batch"], a["weight"]) for a in d["allocations"]] == [
+        ("EARLY", 2.0),
+        ("LATE", 2.0),
+    ]
+    # FEFO untouched: the earlier expiry is allocated first.
+    assert d["allocations"][0]["batch"] == "EARLY"
+
+
+def test_huge_quantity_as_json_number_literal_is_exact():
+    # The bare JSON number 1e30 (no string wrapper) parses exactly too.
+    resp = client.post(
+        "/weight-pick-plan",
+        json={
+            "scans": [],
+            "as_of": "2024-01-01",
+            "demands": [{"gtin": GTIN_OK, "quantity": 1e30}],
+        },
+    )
+    assert resp.status_code == 200
+    assert f'"quantity":{ONE_E30_FIXED}' in resp.text
+    assert f'"shortage":{ONE_E30_FIXED}' in resp.text
+    assert '"fulfilled":0.000000' in resp.text
+
+
+def test_huge_fractional_quantity_renders_six_places():
+    # 31 integer digits and a fractional part: 37 significant digits, well
+    # beyond the 28-digit default context; the six-place suffix survives.
+    resp = plan([], [demand(quantity="1000000000000000000000000000000.5")])
+    assert resp.status_code == 200
+    assert '"quantity":1000000000000000000000000000000.500000' in resp.text
+    assert '"shortage":1000000000000000000000000000000.500000' in resp.text
+
+
+def test_huge_quantity_next_to_an_ordinary_demand():
+    # One response can carry a huge and a normal-sized demand; the normal
+    # demand keeps its ordinary FEFO result while the huge one is exact.
+    resp = plan(
+        [scan(), scan(gtin=GTIN2, expiry="250228")],
+        [demand(quantity="1e30"), demand(gtin=GTIN2, quantity="3")],
+    )
+    assert resp.status_code == 200
+    assert f'"quantity":{ONE_E30_FIXED}' in resp.text
+    first, second = resp.json()["demands"]
+    assert first["fulfilled"] == 2.0
+    assert first["allocations"][0]["weight"] == 2.0
+    assert second["fulfilled"] == 2.0
+    assert second["shortage"] == 1.0
+    assert second["allocations"][0]["weight"] == 2.0
+
+
+def test_huge_quantity_with_excluded_stock():
+    resp = plan(
+        [scan(batch="OLD", expiry="250110"), scan(batch="NEW", expiry="250331")],
+        [demand(quantity="1e30")],
+        as_of="2025-02-01",
+    )
+    assert resp.status_code == 200
+    d = resp.json()["demands"][0]
+    assert d["fulfilled"] == 2.0
+    assert d["excluded_weight"] == 2.0
+    assert d["allocations"] == [{"batch": "NEW", "expiry": "250331", "weight": 2.0}]
+    assert '"excluded_weight":2.000000' in resp.text
+
+
+def test_whole_mode_huge_quantity_takes_every_package():
+    resp = plan(
+        [scan(batch="A"), scan(batch="B")],
+        [demand(quantity="1e30", package_mode="whole")],
+    )
+    assert resp.status_code == 200
+    d = resp.json()["demands"][0]
+    assert [a["weight"] for a in d["allocations"]] == [2.0, 2.0]
+    assert d["fulfilled"] == 4.0
+    assert d["overage"] == 0.0
+    assert '"shortage":999999999999999999999999999996.000000' in resp.text
+
+
+def test_normal_quantity_still_renders_as_six_place_number():
+    # Guard against the precision change perturbing ordinary responses.
+    resp = plan([scan(weight="3103002513")], [demand(quantity="2.513")])
+    assert resp.status_code == 200
+    assert '"quantity":2.513000' in resp.text
+    assert '"fulfilled":2.513000' in resp.text
+    assert '"shortage":0.000000' in resp.text
+
+
 # ---------------------------------------------------------------- scan errors
 
 

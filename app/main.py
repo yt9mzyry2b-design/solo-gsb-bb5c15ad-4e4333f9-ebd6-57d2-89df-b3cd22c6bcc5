@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import date
-from decimal import ROUND_HALF_EVEN, Decimal
+from decimal import ROUND_HALF_EVEN, Decimal, localcontext, getcontext
 from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException
@@ -1005,10 +1005,19 @@ def _dump(value: Any) -> str:
 
 
 def _six(value: Decimal) -> _RawNumber:
-    """Fixed-point token: ``value`` quantized half-even to six places."""
-    return _RawNumber(
-        format(value.quantize(SIX_PLACES, rounding=ROUND_HALF_EVEN), "f")
-    )
+    """Fixed-point token: ``value`` quantized half-even to six places.
+
+    The working context precision is widened to fit the result: a value as
+    large as ``1e30`` needs 31 integer plus 6 fractional digits, which
+    exceeds the default 28-digit context and would otherwise make
+    :meth:`Decimal.quantize` raise :class:`decimal.InvalidOperation`.
+    """
+    integer_digits = max(value.adjusted() + 1, 1)
+    needed = integer_digits + 6
+    with localcontext() as ctx:
+        ctx.prec = max(getcontext().prec, needed)
+        quantized = value.quantize(SIX_PLACES, rounding=ROUND_HALF_EVEN)
+        return _RawNumber(format(quantized, "f"))
 
 
 def _build_summary_response(result: dict) -> Response:
